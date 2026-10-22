@@ -42,11 +42,12 @@ def _airport_summary(airport: dict | None) -> dict | None:
     }
 
 
+
 def _extract_trip_details(slices: list) -> dict:
     """
     Extract outbound and optional return details from Duffel slices.
-    Duffel normally orders slices in journey order: outbound first,
-    return second for a round trip.
+    Preserve the field names expected by the flight-bookings endpoint,
+    while retaining the existing departure_date and arrival_date fields.
     """
     if not isinstance(slices, list) or not slices:
         return {
@@ -58,6 +59,7 @@ def _extract_trip_details(slices: list) -> dict:
         }
 
     normalized_slices = []
+
     for flight_slice in slices:
         if not isinstance(flight_slice, dict):
             continue
@@ -66,25 +68,44 @@ def _extract_trip_details(slices: list) -> dict:
         first_segment = segments[0] if segments else {}
         last_segment = segments[-1] if segments else {}
 
-        origin = flight_slice.get("origin") or first_segment.get("origin")
+        origin = (
+            flight_slice.get("origin")
+            or first_segment.get("origin")
+        )
+
         destination = (
-            flight_slice.get("destination") or last_segment.get("destination")
+            flight_slice.get("destination")
+            or last_segment.get("destination")
         )
 
         departure = (
             flight_slice.get("departing_at")
+            or flight_slice.get("departure_date")
             or first_segment.get("departing_at")
+            or first_segment.get("departure_date")
         )
+
         arrival = (
             flight_slice.get("arriving_at")
+            or flight_slice.get("arrival_date")
             or last_segment.get("arriving_at")
+            or last_segment.get("arrival_date")
         )
 
         normalized_slices.append({
             "origin": _airport_summary(origin),
             "destination": _airport_summary(destination),
+
+            # Expected by the existing /flight-bookings endpoint
+            "departing_at": departure,
+            "arriving_at": arrival,
+
+            # Retain the existing field names for compatibility
             "departure_date": departure,
             "arrival_date": arrival,
+
+            # Preserve flight segments for expanded booking details
+            "segments": segments,
         })
 
     if not normalized_slices:
@@ -97,15 +118,24 @@ def _extract_trip_details(slices: list) -> dict:
         }
 
     outbound = normalized_slices[0]
-    inbound = normalized_slices[1] if len(normalized_slices) > 1 else None
+    inbound = (
+        normalized_slices[1]
+        if len(normalized_slices) > 1
+        else None
+    )
 
     return {
         "origin": outbound.get("origin"),
         "destination": outbound.get("destination"),
-        "departure_date": outbound.get("departure_date"),
-        "return_date": inbound.get("departure_date") if inbound else None,
+        "departure_date": outbound.get("departing_at"),
+        "return_date": (
+            inbound.get("departing_at")
+            if inbound
+            else None
+        ),
         "slices": normalized_slices,
     }
+
 
 
 def create_flight_booking(
@@ -265,23 +295,29 @@ def create_flight_booking(
         total_currency = offer.get("total_currency")
 
     booking_record = {
-        "user_id": str(user_id),
-        "offer_id": offer_id,
-        "provider_order_id": order.get("id"),
-        "booking_reference": order.get("booking_reference"),
-        "status": order.get("status", "unknown"),
-        "booking_type": "hold",
-        "origin": trip_details["origin"],
-        "destination": trip_details["destination"],
-        "departure_date": trip_details["departure_date"],
-        "return_date": trip_details["return_date"],
-        "slices": trip_details["slices"],
-        "total_amount": total_amount,
-        "total_currency": total_currency,
-        "provider": "duffel",
-        "created_at": now,
-        "updated_at": now,
-    }
+    "user_id": str(user_id),
+    "offer_id": offer_id,
+    "provider_order_id": order.get("id"),
+    "booking_reference": order.get("booking_reference"),
+    "status": order.get("status", "unknown"),
+    "booking_type": "hold",
+
+    "origin": trip_details["origin"],
+    "destination": trip_details["destination"],
+    "departure_date": trip_details["departure_date"],
+    "return_date": trip_details["return_date"],
+    "slices": trip_details["slices"],
+
+    "total_amount": total_amount,
+    "total_currency": total_currency,
+    "provider": "duffel",
+
+    # Save passenger information in MongoDB
+    "passenger_details": passengers,
+
+    "created_at": now,
+    "updated_at": now,
+}
 
     # Step 3: Save the provider order reference and flight details in MongoDB.
     try:

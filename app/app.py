@@ -9,14 +9,14 @@ from app.routes.planner import router as planner_router
 from app.routes.booking import router as booking_router
 from app.utils.token_utils import decode_access_token
 
-
+API_PREFIX = "/api/v1"
 # Routes that must remain accessible without a JWT.
 PUBLIC_PATHS = {
     "/",
-    "/authentication/signup",
-    "/authentication/login",
-    "/authentication/forgot-password",
-    "/authentication/reset-password",
+    "/api/v1/authentication/signup",
+    "/api/v1/authentication/login",
+    "/api/v1/authentication/forgot-password",
+    "/api/v1/authentication/reset-password",
     "/docs",
     "/redoc",
     "/openapi.json",
@@ -95,8 +95,19 @@ def create_app():
     )
 
     # Keep all existing routers.
-    app.include_router(authentication_router)
-    app.include_router(planner_router)
-    app.include_router(booking_router)
+    # Register all existing routers under the versioned API prefix.
+    app.include_router(
+        authentication_router,
+        prefix=API_PREFIX
+    )
 
+    app.include_router(
+        planner_router,
+        prefix=API_PREFIX
+    )
+
+    app.include_router(
+        booking_router,
+        prefix=API_PREFIX
+    )
     return app

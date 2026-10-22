@@ -49,6 +49,7 @@ def _owned_conversation(user_id: str, conversation_id: str):
     return conversation_collection.find_one({
         "user_id": str(user_id),
         "conversation_id": conversation_id,
+        "is_deleted": {"$ne": True},
     })
 
 
@@ -68,7 +69,7 @@ def planner_message(
 @router.get("/history")
 def list_conversations(user_id: str = Depends(get_current_user_id)):
     docs = conversation_collection.find(
-        {"user_id": str(user_id)},
+        {"user_id": str(user_id), "is_deleted": {"$ne": True}},
         {"_id": 0, "conversation_id": 1, "title": 1, "updated_at": 1, "messages": 1},
     ).sort("updated_at", -1)
     result = []
@@ -95,6 +96,29 @@ def get_conversation(
         "title": doc.get("title", "New Trip"),
         "messages": doc.get("messages", []),
     }
+
+
+@router.delete("/history/{conversation_id}")
+def soft_delete_conversation(
+    conversation_id: str,
+    user_id: str = Depends(get_current_user_id),
+):
+    """Hide a conversation from the user without deleting its database record."""
+    result = conversation_collection.update_one(
+        {
+            "user_id": str(user_id),
+            "conversation_id": conversation_id,
+            "is_deleted": {"$ne": True},
+        },
+        {"$set": {
+            "is_deleted": True,
+            "deleted_at": datetime.now(timezone.utc).isoformat(),
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }},
+    )
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+    return {"success": True, "soft_deleted": True}
 
 
 @router.put("/history")
@@ -343,6 +367,8 @@ def get_flight_bookings(
             "price": booking.get("total_amount"),
             "currency": booking.get("total_currency"),
             "provider": booking.get("provider"),
+            "passenger_details": booking.get("passenger_details") or {},
+            "passengers": booking.get("passengers") or [],
         })
 
     return {"bookings": result}
