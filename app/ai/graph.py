@@ -8,9 +8,18 @@ from app.database import client, DATABASE_NAME
 
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.tools import tool
+from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
 
 from app.ai.state import TripState
-from app.config import GEMINI_API_KEY
+from app.config import (
+    GEMINI_API_KEY,
+    GEMINI_PRIMARY_MODEL,
+    GEMINI_FALLBACK_MODEL,
+)
+from google import genai
+from app.ai.agent import GeminiAgent
+from app.ai.tool_adapters import get_weather as central_get_weather, get_flights as central_get_flights
+from app.ai.tool_registry import build_tool_registry
 
 from app.tools.weather_tool import weather_tool
 from app.tools.flight_tool import flight_tool
@@ -21,9 +30,159 @@ from app.tools.flight_tool import flight_tool
 # ============================================================
 
 llm = ChatGoogleGenerativeAI(
-    model="gemini-3.1-flash-lite",
+    model=GEMINI_PRIMARY_MODEL,
     google_api_key=GEMINI_API_KEY
 )
+
+fallback_llm = ChatGoogleGenerativeAI(
+    model=GEMINI_FALLBACK_MODEL,
+    google_api_key=GEMINI_API_KEY
+)
+
+def invoke_with_gemini_fallback(primary_model, fallback_model, prompt):
+    try:
+        return primary_model.invoke(prompt)
+
+    except Exception as exc:
+        status_code = (
+            getattr(exc, "code", None)
+            or getattr(exc, "status_code", None)
+        )
+
+        response = getattr(exc, "response", None)
+
+        if status_code is None and response is not None:
+            status_code = getattr(response, "status_code", None)
+
+        try:
+            is_503 = int(status_code) == 503
+        except (TypeError, ValueError):
+            is_503 = False
+
+        if not is_503:
+            raise
+
+        print(
+            f"Primary Gemini model failed with HTTP 503. "
+            f"Trying fallback model: {GEMINI_FALLBACK_MODEL}",
+            flush=True,
+        )
+
+        return fallback_model.invoke(prompt)
+
+# Shared Gemini function-calling client. The graph still controls workflow stages;
+# only the stage-authorized read/search tool is exposed to each agent invocation.
+_gemini_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
+_central_tools = build_tool_registry(central_get_weather, central_get_flights)
+
+
+def _run_central_tool_agent(
+    *,
+    user_message: str,
+    trip_context: dict,
+    tool_name: str,
+) -> dict:
+    """Run the central Gemini tool loop with only the current stage's tool."""
+    if _gemini_client is None:
+        return {
+            "status": "error",
+            "message": "Gemini API key is not configured.",
+            "tool_calls": [],
+            "tool_results": [],
+            "iterations": 0,
+        }
+
+    allowed_tools = {tool_name: _central_tools[tool_name]}
+    print(f"[CENTRAL GEMINI] Starting agent; allowed_tool={tool_name}", flush=True)
+    agent = GeminiAgent(
+        client=_gemini_client,
+        model=GEMINI_PRIMARY_MODEL,
+        fallback_model=GEMINI_FALLBACK_MODEL,
+        tools=allowed_tools,
+        max_iterations=4,
+    )
+    result = agent.run(
+        user_message=user_message,
+        trip_context=trip_context,
+    )
+    print(
+        "[CENTRAL GEMINI] Finished agent; "
+        f"status={result.get('status')}; "
+        f"tool_calls={[call.get('name') for call in result.get('tool_calls', [])]}; "
+        f"iterations={result.get('iterations')}",
+        flush=True,
+    )
+    return result
+
+
+
+def _run_central_message_agent(
+    *,
+    draft_message: str,
+    trip_context: dict | None = None,
+) -> dict:
+    """
+    Generate natural user-facing planner messages using Gemini.
+
+    Gemini handles wording only. The backend remains responsible for
+    validation, workflow decisions, state transitions, and tool execution.
+    """
+    if _gemini_client is None:
+        return {
+            "status": "error",
+            "message": "",
+            "tool_calls": [],
+            "tool_results": [],
+            "iterations": 0,
+        }
+
+    context = dict(trip_context or {})
+    context["backend_outcome_draft"] = draft_message or ""
+
+    agent = GeminiAgent(
+        client=_gemini_client,
+        model=GEMINI_PRIMARY_MODEL,
+        fallback_model=GEMINI_FALLBACK_MODEL,
+        tools={},
+        max_iterations=1,
+    )
+    return agent.run(
+        user_message=(
+            "You are the conversational assistant for a travel-planning "
+            "application.\n\n"
+
+            "Your responsibility is to communicate the backend's verified "
+            "outcome naturally and clearly.\n\n"
+
+            "RULES:\n"
+            "1. Use the supplied conversation state and backend outcome "
+            "as the only source of truth.\n"
+            "2. Generate friendly, natural and concise responses.\n"
+            "3. If information is missing, ask only for the information "
+            "needed for the current workflow stage.\n"
+            "4. If the backend outcome contains a question, preserve its "
+            "meaning but phrase it naturally.\n"
+            "5. Preserve important prices, dates, locations, booking "
+            "references, errors and warnings accurately.\n"
+            "6. Never invent passenger details, prices, availability, "
+            "booking status or payment status.\n"
+            "7. Never claim that a search, booking or payment succeeded "
+            "unless the backend outcome confirms it.\n"
+            "8. Do not ask questions that have already been answered "
+            "in the supplied conversation state.\n"
+            "9. Do not change the next action or workflow stage.\n"
+            "10. Do not expose internal variable names, tool names, "
+            "debug information or implementation details.\n"
+            "11. If the backend outcome is an error, explain it clearly "
+            "without hiding the error.\n"
+            "12. Return only the final message shown to the user. "
+            "Do not return JSON or explanations about your reasoning.\n\n"
+
+            "BACKEND OUTCOME:\n"
+            f"{draft_message or ''}"
+        ),
+        trip_context=context,
+    )
 
 
 # ============================================================
@@ -42,6 +201,14 @@ def classify_chat_intent(message: str, state: dict | None = None) -> dict:
         "start_date": state.get("start_date"),
         "end_date": state.get("end_date"),
         "budget": state.get("budget"),
+        "traveller_count": state.get("traveller_count"),
+        "adults": state.get("adults"),
+        "children": state.get("children"),
+        "child_ages": state.get("child_ages"),
+        "passenger_count_confirmed": state.get("passenger_count_confirmed"),
+        "cabin_class": state.get("cabin_class"),
+        "journey_type": state.get("journey_type"),
+        "hotel_booking_skipped": state.get("hotel_booking_skipped"),
         "flight_direction": state.get("flight_direction"),
         "available_flight_count": len(
             state.get("outbound_flights") or state.get("flights") or []
@@ -58,17 +225,41 @@ CONTEXT JSON:
 LATEST USER MESSAGE:
 {message}
 
-Choose exactly one intent from:
-start_trip, confirm_travel, decline_travel, provide_origin,
-provide_destination, provide_dates, provide_budget, update_budget,
-confirm_weather, change_dates, continue_despite_budget,
-select_outbound_flight, select_return_flight, ask_hotel,
-booking_question, general_question, unclear.
+Choose the intent that best describes what the user wants NOW. Users may
+change their mind at any stage, including while viewing flights or hotels.
+Recognize natural phrasing, corrections, and combined requests, not only exact
+keywords. Examples include changing the route, dates, budget, traveller count,
+trip type or cabin; asking a question; requesting hotel search; skipping hotels;
+starting over; selecting an offer; or confirming a pending step.
 
-Extract only values supported by the message and context. A bare numeric
-message is update_budget only when the current stage is budget_confirmation
-or the assistant is asking for a new budget. Do not treat a flight option
-number as a budget. Do not claim a booking has occurred.
+Choose exactly one primary intent from:
+start_trip, confirm_travel, decline_travel, provide_origin,
+provide_destination, provide_dates, provide_budget, update_trip_details,
+update_budget, confirm_weather, change_dates, continue_despite_budget,
+select_outbound_flight, select_return_flight, ask_hotel, skip_hotel,
+restart_trip, booking_question, general_question, unclear.
+
+Extract EVERY trip field explicitly supplied or corrected by the user, even when
+only one field changes. Preserve other values from context; do not invent them.
+If the user says to keep existing dates/route, leave those extracted fields null
+unless the message explicitly repeats the values.
+
+A user may change origin, destination, dates, budget, passenger counts,
+child ages, cabin class, or journey type in one message.
+
+Extract passenger information when explicitly provided:
+- "2 adults and 1 child aged 8" means adults=2, children=1, child_ages=[8].
+- "3 adults" means adults=3, children=0, child_ages=[].
+- "2 adults and 2 children aged 5 and 10" means
+  adults=2, children=2, child_ages=[5, 10].
+
+Do not assume passenger counts or child ages. If a value is not explicitly
+provided, return null. If children are explicitly zero, return children=0
+and child_ages=[].
+
+Distinguish changing trip details from selecting a flight option. A bare
+number is update_budget only when the current stage is budget_confirmation
+or the assistant is asking for a new budget. Never claim a booking has occurred.
 
 Return ONLY valid JSON:
 {{
@@ -79,11 +270,21 @@ Return ONLY valid JSON:
   "start_date": null,
   "end_date": null,
   "budget": null,
+  "traveller_count": null,
+  "adults": null,
+  "children": null,
+  "child_ages": null,
+  "cabin_class": null,
+  "journey_type": null,
   "flight_option": null
 }}
 """
     try:
-        response = llm.invoke(prompt)
+        response = invoke_with_gemini_fallback(
+            llm,
+            fallback_llm,
+            prompt
+        )
         content = get_response_text(response)
         content = re.sub(r"^```(?:json)?\s*|\s*```$", "", content.strip(), flags=re.I)
         parsed = json.loads(content)
@@ -92,8 +293,9 @@ Return ONLY valid JSON:
             "provide_origin", "provide_destination", "provide_dates",
             "provide_budget", "update_budget", "confirm_weather",
             "change_dates", "continue_despite_budget",
-            "select_outbound_flight", "select_return_flight", "ask_hotel",
-            "booking_question", "general_question", "unclear",
+            "update_trip_details", "select_outbound_flight", "select_return_flight",
+            "ask_hotel", "skip_hotel", "restart_trip", "booking_question",
+            "general_question", "unclear",
         }
         if parsed.get("intent") not in allowed:
             parsed["intent"] = "unclear"
@@ -178,6 +380,96 @@ def get_response_text(response) -> str:
         )
 
     return str(content)
+
+
+# ============================================================
+# MODEL-DIRECTED TOOL CALLING
+# ============================================================
+
+def run_tool_calling_loop(
+    system_prompt: str,
+    user_prompt: str,
+    tools: list,
+    max_iterations: int = 6,
+) -> dict:
+    """
+    Let the model choose registered tools, execute its actual tool calls,
+    return tool results to the model, and continue until it answers.
+
+    This helper is for read/search tools. Consequential actions such as
+    booking and payment must use separate backend validation and explicit
+    confirmation; they must not be registered here without those controls.
+    """
+    if max_iterations < 1:
+        raise ValueError("max_iterations must be at least 1")
+
+    tool_map = {registered_tool.name: registered_tool for registered_tool in tools}
+    model = llm.bind_tools(tools)
+    fallback_bound_model = fallback_llm.bind_tools(tools)
+    messages = [
+        SystemMessage(content=system_prompt),
+        HumanMessage(content=user_prompt),
+    ]
+    tool_results = []
+
+    for iteration in range(max_iterations):
+        response = invoke_with_gemini_fallback(
+            model,
+            fallback_bound_model,
+            messages
+        )
+        messages.append(response)
+
+        tool_calls = getattr(response, "tool_calls", None) or []
+        if not tool_calls:
+            return {
+                "response": get_response_text(response),
+                "tool_results": tool_results,
+                "iterations": iteration + 1,
+                "limit_reached": False,
+            }
+
+        for index, tool_call in enumerate(tool_calls):
+            tool_name = tool_call.get("name")
+            tool_args = tool_call.get("args") or {}
+            tool_call_id = tool_call.get("id") or f"tool-call-{iteration}-{index}"
+            registered_tool = tool_map.get(tool_name)
+
+            if registered_tool is None:
+                result = {
+                    "success": False,
+                    "error": f"Tool '{tool_name}' is not registered.",
+                }
+            else:
+                try:
+                    result = registered_tool.invoke(tool_args)
+                except Exception as exc:
+                    # Keep internal exception details out of the conversation.
+                    result = {
+                        "success": False,
+                        "error": f"Tool execution failed ({type(exc).__name__}).",
+                    }
+
+            tool_results.append({
+                "tool": tool_name,
+                "result": result,
+            })
+            messages.append(
+                ToolMessage(
+                    content=json.dumps(result, ensure_ascii=False, default=str),
+                    tool_call_id=tool_call_id,
+                )
+            )
+
+    return {
+        "response": (
+            "I couldn't complete the request within the tool-call limit. "
+            "Please try again."
+        ),
+        "tool_results": tool_results,
+        "iterations": max_iterations,
+        "limit_reached": True,
+    }
 
 
 # ============================================================
@@ -276,86 +568,100 @@ def suggest_alternative_date_ranges(
 # ============================================================
 
 def classify_weather_confirmation(
-    message: str
+    message: str,
+    state: dict | None = None,
 ) -> bool | None:
-    """Classify the user's meaning in the weather-confirmation stage.
+    """Use Gemini to classify a reply to the current weather/date question.
 
-    Explicit negations are handled first so phrases such as
-    "I don't want to change dates" cannot be mistaken for a date-change
-    request. Ambiguous wording is then reviewed by Gemini.
+    Returns:
+        True: user wants to keep the current dates and continue.
+        False: user wants to choose different dates.
+        None: intent is unclear, or Gemini output is unavailable/invalid.
+
+    This classifier is intentionally called only while the conversation is
+    in the weather_confirmation stage. It does not mutate workflow state.
     """
-    normalized = re.sub(r"\s+", " ", message.lower()).strip()
-
-    # Deterministic guardrails for common, unambiguous replies.
-    keep_date_phrases = (
-        "i don't want to change dates",
-        "i do not want to change dates",
-        "i don't want to change the dates",
-        "i do not want to change the dates",
-        "i don't want to change my dates",
-        "i do not want to change my dates",
-        "don't change dates",
-        "do not change dates",
-        "keep the dates",
-        "keep these dates",
-        "keep my dates",
-        "no change",
-        "no need to change",
-        "leave the dates as they are",
-        "leave dates as they are",
-    )
-    if any(phrase in normalized for phrase in keep_date_phrases):
-        return True
-
-    change_date_phrases = (
-        "change dates",
-        "change the dates",
-        "change my dates",
-        "change travel dates",
-        "different dates",
-        "new dates",
-        "i want to change",
-        "i would like to change",
-        "i want different dates",
-    )
-    if any(phrase in normalized for phrase in change_date_phrases):
-        return False
+    state = state or {}
+    context = {
+        "conversation_stage": state.get("conversation_stage"),
+        "next_step": state.get("next_step"),
+        "assistant_question": state.get("assistant_response"),
+        "origin": state.get("origin"),
+        "destination": state.get("destination"),
+        "start_date": state.get("start_date"),
+        "end_date": state.get("end_date"),
+        "weather_available": isinstance(state.get("weather"), dict),
+        "weather_confirmed": state.get("weather_confirmed"),
+    }
 
     prompt = f"""
-The user was shown weather information for their planned trip.
-Classify the meaning of their latest reply in this context.
+You are classifying the user's latest reply to a travel planner's question
+about whether to keep the current travel dates or choose different dates.
 
-- true: they want to keep the current dates and continue, including
-  "I don't want to change dates", "no, keep these dates", or "continue".
-- false: they explicitly want to choose different travel dates.
-- null: their intent is unclear or they ask something unrelated.
+CONVERSATION CONTEXT:
+{json.dumps(context, ensure_ascii=False)}
 
-Important: Do not interpret the word "change" alone as a request to
-change dates when the sentence explicitly says they do NOT want a change.
+LATEST USER MESSAGE:
+{message}
 
-User message: {message}
+Choose exactly one decision:
 
-Return ONLY valid JSON, with confirmed set to true, false, or null:
-{{"confirmed": true}}
-{{"confirmed": false}}
-{{"confirmed": null}}
+- "confirm_dates": The user wants to keep the currently selected dates and
+  continue. This includes natural replies such as agreeing, approving,
+  proceeding, saying the dates are fine, or asking to go ahead.
+- "change_dates": The user wants to choose different travel dates, reschedule,
+  or replace the current dates.
+- "unclear": The user asks an unrelated question, gives information that does
+  not answer the date question, expresses uncertainty, or the meaning is
+  ambiguous.
+
+Important rules:
+- Interpret the complete meaning, not isolated keywords.
+- A sentence such as "I don't want to change the dates" means confirm_dates.
+- A sentence such as "I want to change the dates" means change_dates.
+- Do not treat passenger counts, budget updates, route updates, or unrelated
+  questions as confirmation.
+- Do not invent dates or change any trip information.
+- Return only valid JSON. Do not include Markdown or explanations.
+
+Required JSON format:
+{{
+  "decision": "confirm_dates | change_dates | unclear",
+  "confidence": 0.0
+}}
 """
 
     try:
-        response = llm.invoke(prompt)
+        response = invoke_with_gemini_fallback(
+            llm,
+            fallback_llm,
+            prompt
+        )
         content = get_response_text(response).strip()
-        # Tolerate fenced JSON returned by the model.
-        content = re.sub(r"^```(?:json)?\s*|\s*```$", "", content, flags=re.I)
+        content = re.sub(
+            r"^```(?:json)?\s*|\s*```$",
+            "",
+            content,
+            flags=re.I,
+        )
         result = json.loads(content)
-        value = result.get("confirmed")
-        if value is True:
+
+        decision = result.get("decision")
+        try:
+            confidence = float(result.get("confidence", 0.0))
+        except (TypeError, ValueError):
+            confidence = 0.0
+
+        if confidence < 0.65:
+            return None
+        if decision == "confirm_dates":
             return True
-        if value is False:
+        if decision == "change_dates":
             return False
         return None
-    except Exception:
-        # If the LLM is unavailable or returns malformed output, do not
-        # guess that an ambiguous message means the user confirmed.
+
+    except Exception as exc:
+        print(f"[WEATHER CONFIRMATION] Gemini classification failed: {exc}", flush=True)
         return None
 
 
@@ -398,7 +704,11 @@ or
 {{"change_dates": false}}
 """
 
-    response = llm.invoke(prompt)
+    response = invoke_with_gemini_fallback(
+        llm,
+        fallback_llm,
+        prompt
+    )
 
     content = get_response_text(
         response
@@ -647,7 +957,9 @@ or
 {{"option": null}}
 """
 
-    response = llm.invoke(
+    response = invoke_with_gemini_fallback(
+        llm,
+        fallback_llm,
         prompt
     )
 
@@ -816,10 +1128,9 @@ def extract_trip_info(
 
     if conversation_stage == "weather_confirmation":
 
-        confirmation = (
-            classify_weather_confirmation(
-                message
-            )
+        confirmation = classify_weather_confirmation(
+            message,
+            state,
         )
 
         if confirmation is True:
@@ -1039,7 +1350,9 @@ Return ONLY valid JSON:
 }}
 """
 
-    response = llm.invoke(
+    response = invoke_with_gemini_fallback(
+        llm,
+        fallback_llm,
         prompt
     )
 
@@ -1324,135 +1637,74 @@ def _weather_is_unfavorable(weather_result: dict) -> tuple[bool, list[str]]:
 # WEATHER AGENT
 # ============================================================
 
-def weather_agent(
-    state: TripState
-):
+def weather_agent(state: TripState):
+    destination = state.get("destination")
+    start_date = state.get("start_date")
+    end_date = state.get("end_date")
 
-    destination = state.get(
-        "destination"
+    # This node is reached only after the graph has collected required trip
+    # information. The central agent receives the current values, not a sample query.
+    tool_run = _run_central_tool_agent(
+        tool_name="get_weather",
+        user_message=(
+            "Retrieve the actual weather forecast for the destination and date "
+            "range in the supplied trip context. Call get_weather using those "
+            "values only. Do not search flights in this stage."
+        ),
+        trip_context={
+            "destination": destination,
+            "start_date": start_date,
+            "end_date": end_date,
+            "conversation_stage": state.get("conversation_stage"),
+        },
     )
 
-    start_date = state.get(
-        "start_date"
+    weather_result = next(
+        (
+            item["result"]
+            for item in reversed(tool_run.get("tool_results", []))
+            if item.get("tool") == "get_weather"
+            and isinstance(item.get("result"), dict)
+        ),
+        None,
     )
-
-    end_date = state.get(
-        "end_date"
-    )
-
-    prompt = f"""
-You are the weather agent for an
-AI travel planner.
-
-Destination:
-{destination}
-
-Start date:
-{start_date}
-
-End date:
-{end_date}
-
-You MUST call the get_weather tool.
-
-Use exactly these values:
-
-location = "{destination}"
-start_date = "{start_date}"
-end_date = "{end_date}"
-"""
-
-    weather_llm = llm.bind_tools(
-        [get_weather]
-    )
-
-    weather_llm.invoke(
-        prompt
-    )
-
-    weather_result = (
-        get_weather.invoke(
-            {
-                "location":
-                    destination,
-
-                "start_date":
-                    start_date,
-
-                "end_date":
-                    end_date
-            }
-        )
-    )
-
-    # ========================================================
-    # WEATHER NOT AVAILABLE
-    # ========================================================
-
-    if not weather_result.get(
-        "forecast_available",
-        False
-    ):
-
-        return {
-
-            "weather":
-                weather_result,
-
-            # A missing forecast must not count as user confirmation.
-            # Keep the user in the weather-confirmation stage so they
-            # can explicitly continue or choose different dates.
-            "weather_confirmed":
-                None,
-
-            "suggested_dates": suggest_alternative_date_ranges(
-                start_date,
-                end_date
-            ),
-
-            "conversation_stage":
-                "weather_confirmation",
-
-            "next_step":
-                "weather_confirmation",
-
-            "assistant_response":
-                (
-                    "I couldn't retrieve a weather forecast for "
-                    "those dates. You can still continue with these "
-                    "dates or choose another date range. Would you "
-                    "like to continue or change your travel dates?"
-                )
+    if weather_result is None:
+        weather_result = {
+            "forecast_available": False,
+            "error": tool_run.get("message") or "The weather tool was not successfully executed.",
         }
 
-    # ========================================================
-    # WEATHER AVAILABLE: classify forecast and route accordingly
-    # ========================================================
+    if not weather_result.get("forecast_available", False):
+        return {
+            "weather": weather_result,
+            "weather_confirmed": None,
+            "suggested_dates": suggest_alternative_date_ranges(start_date, end_date),
+            "conversation_stage": "weather_confirmation",
+            "next_step": "weather_confirmation",
+            "assistant_response": (
+                "I couldn't retrieve a weather forecast for those dates. You can "
+                "still continue with these dates or choose another date range. "
+                "Would you like to continue or change your travel dates?"
+            ),
+        }
 
     unfavorable, weather_warnings = _weather_is_unfavorable(weather_result)
-
     if unfavorable:
         warning_text = " ".join(weather_warnings)
         return {
             "weather": weather_result,
             "weather_confirmed": None,
-            "suggested_dates": suggest_alternative_date_ranges(
-                start_date,
-                end_date
-            ),
+            "suggested_dates": suggest_alternative_date_ranges(start_date, end_date),
             "conversation_stage": "weather_confirmation",
             "next_step": "weather_confirmation",
             "assistant_response": (
-                f"⚠️ Weather warning for {destination} from "
-                f"{start_date} to {end_date}. {warning_text} "
-                "I recommend checking the alternative dates below. "
-                "Choose an alternative range to check its forecast, or "
-                "reply 'continue' if you want to keep these dates."
+                f"Weather warning for {destination} from {start_date} to {end_date}. "
+                f"{warning_text} I recommend checking the alternative dates below. "
+                "Choose an alternative range to check its forecast, or reply "
+                "'continue' if you want to keep these dates."
             ),
         }
 
-    # Good/acceptable forecast: continue directly to flight search.
-    # The service returns the forecast alongside outbound flight results.
     return {
         "weather": weather_result,
         "weather_confirmed": True,
@@ -1460,9 +1712,9 @@ end_date = "{end_date}"
         "conversation_stage": "flight_search",
         "next_step": "flight_search",
         "assistant_response": (
-            f"✅ The weather forecast for {destination} from "
-            f"{start_date} to {end_date} looks suitable based on the "
-            "available forecast. I'll show you outbound flight options now."
+            f"The weather forecast for {destination} from {start_date} to {end_date} "
+            "looks suitable based on the available forecast. I'll show you outbound "
+            "flight options now."
         ),
     }
 
@@ -1471,163 +1723,68 @@ end_date = "{end_date}"
 # FLIGHT AGENT
 # ============================================================
 
-def flight_agent(
-    state: TripState
-):
+def flight_agent(state: TripState):
+    origin = state.get("origin")
+    destination = state.get("destination")
+    start_date = state.get("start_date")
+    end_date = state.get("end_date")
+    traveller_count = state.get("traveller_count") or 1
+    journey_type = "return" if end_date else "one_way"
 
-    origin = state.get(
-        "origin"
+    # This node is only reached after the graph's weather/budget gates permit
+    # flight search. The agent can call flight search only, never booking/payment.
+    tool_run = _run_central_tool_agent(
+        tool_name="get_flights",
+        user_message=(
+            "Search live flight offers using the exact route, dates, and passenger "
+            "count in the supplied trip context. Call get_flights with those values. "
+            "Do not invent offers and do not book or pay. Do not search weather in this stage."
+        ),
+        trip_context={
+            "origin": origin,
+            "destination": destination,
+            "start_date": start_date,
+            "end_date": end_date,
+            "journey_type": journey_type,
+            "adults": traveller_count,
+            "children": 0,
+            "cabin_class": state.get("cabin_class") or "economy",
+            "conversation_stage": state.get("conversation_stage"),
+        },
     )
 
-    destination = state.get(
-        "destination"
+    flight_result = next(
+        (
+            item["result"]
+            for item in reversed(tool_run.get("tool_results", []))
+            if item.get("tool") == "get_flights"
+            and isinstance(item.get("result"), dict)
+        ),
+        None,
     )
-
-    start_date = state.get(
-        "start_date"
-    )
-
-    end_date = state.get(
-        "end_date"
-    )
-
-    prompt = f"""
-You are the flight search agent.
-
-Search flights for:
-
-Origin:
-{origin}
-
-Destination:
-{destination}
-
-Start date:
-{start_date}
-
-End date:
-{end_date}
-
-You MUST call the get_flights tool.
-
-Use exactly the supplied values.
-"""
-
-    flight_llm = llm.bind_tools(
-        [get_flights]
-    )
-
-    flight_llm.invoke(
-        prompt
-    )
-
-    flight_result = (
-        get_flights.invoke(
-            {
-                "origin":
-                    origin,
-
-                "destination":
-                    destination,
-
-                "start_date":
-                    start_date,
-
-                "end_date":
-                    end_date
-            }
-        )
-    )
-
-    if not flight_result.get(
-        "success"
-    ):
-
-        return {
-
-            "flights":
-                [],
-
-            "conversation_stage":
-                "flight_results",
-
-            "next_step":
-                "flight_error",
-
-            "assistant_response":
-                (
-                    "I couldn't find "
-                    "suitable flights "
-                    "for those dates."
-                )
+    if flight_result is None:
+        flight_result = {
+            "success": False,
+            "offers": [],
+            "error": tool_run.get("message") or "The flight search tool was not successfully executed.",
         }
 
-    final_prompt = f"""
-You are an AI travel planner.
+    if not flight_result.get("success"):
+        return {
+            "flights": [],
+            "conversation_stage": "flight_results",
+            "next_step": "flight_error",
+            "assistant_response": "I couldn't find suitable flights for those dates.",
+        }
 
-Trip:
-
-Origin:
-{origin}
-
-Destination:
-{destination}
-
-Travel dates:
-{start_date} to {end_date}
-
-Budget:
-₹{state.get("budget")}
-
-Flight search results:
-
-{json.dumps(
-    flight_result,
-    indent=2
-)}
-
-Present the best flight options.
-
-Rules:
-
-- Use price_inr.
-- Display prices using ₹.
-- Do not perform currency conversion.
-- Mention airline.
-- Mention flight number.
-- Mention departure.
-- Mention arrival.
-- Mention duration.
-- Separate outbound and return journeys.
-- Prioritize options within the user's budget.
-- Do not expose API, tool, or JSON details.
-"""
-
-    final_response = llm.invoke(
-        final_prompt
-    )
-
+    # Keep existing graph state contract: the service formats and presents offers.
+    offers = flight_result.get("offers") or flight_result.get("flights") or []
     return {
-
-        "flights":
-            flight_result.get(
-                "offers",
-                []
-            ),
-
-        "selected_flight":
-            None,
-
-        "conversation_stage":
-            "flight_results",
-
-        "next_step":
-            "complete",
-
-        "assistant_response":
-            get_response_text(
-                final_response
-            )
+        "flights": offers,
+        "outbound_flights": offers,
+        "conversation_stage": "flight_results",
+        "next_step": "flight_results",
+        "assistant_response": "I found flight options for your trip. Please review the available options.",
     }
 
 

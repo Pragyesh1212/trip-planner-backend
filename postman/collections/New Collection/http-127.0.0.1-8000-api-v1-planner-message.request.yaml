@@ -1,0 +1,21 @@
+$kind: http-request
+name: http://127.0.0.1:8000/api/v1/planner/message
+description: ""
+url: http://127.0.0.1:8000/api/v1/planner/message
+method: POST
+body:
+  type: json
+  content: "\r
+
+    {\r
+
+    \  \"message\": \"Skip hotels and finish my trip plan.\",\r
+
+    \  \"conversation_id\": \"postman-flight-date-test\"\r
+
+    }\r\n"
+auth:
+  type: bearer
+  credentials:
+    token: "{{json_web_token_047e}}"
+order: 2000

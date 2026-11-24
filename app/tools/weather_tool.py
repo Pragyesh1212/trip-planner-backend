@@ -339,6 +339,30 @@ def weather_tool(
             "error": "End date cannot be before start date."
         }
 
+    # A trip-planning forecast must not silently treat past dates as a
+    # current/future forecast. Open-Meteo's forecast endpoint is not the
+    # historical-weather endpoint. Reject any range that has already ended.
+    if end < today:
+        return {
+            "success": False,
+            "forecast_available": False,
+            "error": "The requested travel dates are in the past. Choose current or future dates to retrieve a forecast.",
+            "requested_start_date": start_date,
+            "requested_end_date": end_date,
+        }
+
+    # A range that starts before today but ends today/future is also not a
+    # pure forecast range. Reject it explicitly rather than returning a
+    # partial/misleading result.
+    if start < today:
+        return {
+            "success": False,
+            "forecast_available": False,
+            "error": "The requested travel range starts in the past. Choose today or a future start date to retrieve a forecast.",
+            "requested_start_date": start_date,
+            "requested_end_date": end_date,
+        }
+
     # ---------------------------------------------------------
     # Open-Meteo forecast window
     # ---------------------------------------------------------

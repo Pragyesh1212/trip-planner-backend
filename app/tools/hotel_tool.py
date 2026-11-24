@@ -19,6 +19,7 @@ def search_hotels(
     checkin: str,
     checkout: str,
     adults: int = 1,
+    child_ages: list[int] | None = None,
     currency: str = "INR",
     guest_nationality: str = "IN",
     limit: int = 8,
@@ -46,6 +47,24 @@ def search_hotels(
         return {"success": False, "error": "Hotel check-out must be after check-in.", "hotels": []}
     if adults < 1:
         return {"success": False, "error": "At least one adult guest is required.", "hotels": []}
+    child_ages = child_ages or []
+
+    if not isinstance(child_ages, list):
+        return {
+            "success": False,
+            "error": "Child ages must be provided as a list.",
+            "hotels": [],
+        }
+
+    if any(
+        isinstance(age, bool) or not isinstance(age, int) or age < 0
+        for age in child_ages
+    ):
+        return {
+            "success": False,
+            "error": "Every child must have a valid age.",
+            "hotels": [],
+        }
 
     
     payload = {
@@ -55,8 +74,9 @@ def search_hotels(
         "guestNationality": (guest_nationality or "IN").upper(),
         "occupancies": [
             {
+                "rooms": 1,
                 "adults": int(adults),
-                "children": []
+                "children": child_ages,
             }
         ],
         "countryCode": "IN",
@@ -66,6 +86,12 @@ def search_hotels(
 
 
     try:
+        print("[HOTEL SEARCH OCCUPANCY]", {
+            "adults": payload["occupancies"][0]["adults"],
+            "children": payload["occupancies"][0]["children"],
+            "child_count": len(payload["occupancies"][0]["children"])
+        }, flush=True)
+        print("[HOTEL SEARCH REQUEST PAYLOAD]", payload, flush=True)
         response = requests.post(
             f"{LITEAPI_BASE_URL}/hotels/rates",
             headers={

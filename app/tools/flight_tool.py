@@ -342,7 +342,11 @@ def flight_tool(
     start_date: str,
     end_date: str | None = None,
     cabin_class: str = "economy",
-    max_results: int = 5
+    max_results: int = 5,
+    journey_type: str | None = None,
+    adults: int = 1,
+    children: int = 0,
+    multi_city_segments: list[dict] | None = None
 ) -> dict:
 
     if not DUFFEL_API_KEY:
@@ -354,154 +358,198 @@ def flight_tool(
             )
         }
 
-    # Validate dates
-    try:
+    # Validate passenger counts and search options.
+    if not isinstance(adults, int) or adults < 1:
+        return {
+            "success": False,
+            "error": "At least one adult passenger is required."
+        }
 
-        start = date.fromisoformat(
-            start_date
-        )
+    if not isinstance(children, int) or children < 0:
+        return {
+            "success": False,
+            "error": "Children count must be zero or greater."
+        }
 
-        if end_date:
+    if adults + children > 9:
+        return {
+            "success": False,
+            "error": "A maximum of 9 passengers can be searched in one request."
+        }
 
-            end = date.fromisoformat(
-                end_date
-            )
-
-        else:
-
-            end = None
-
-    except ValueError:
-
+    supported_cabin_classes = {
+        "economy",
+        "premium_economy",
+        "business",
+        "first"
+    }
+    cabin_class = cabin_class.strip().lower().replace(" ", "_")
+    if cabin_class not in supported_cabin_classes:
         return {
             "success": False,
             "error": (
-                "Invalid date format. "
-                "Use YYYY-MM-DD."
+                "Unsupported cabin class. Use economy, premium_economy, "
+                "business, or first."
             )
         }
 
-    if end and end < start:
-
+    if not isinstance(max_results, int) or max_results < 1:
         return {
             "success": False,
-            "error": (
-                "End date cannot be before "
-                "start date."
-            )
+            "error": "max_results must be a positive integer."
         }
 
-    # Resolve origin
-    try:
+    journey_type = (journey_type or ("return" if end_date else "one_way")).strip().lower()
+    if journey_type in {"one-way", "one way"}:
+        journey_type = "one_way"
+    elif journey_type in {"round_trip", "round-trip", "round trip"}:
+        journey_type = "return"
+    elif journey_type in {"multi-city", "multi city", "multicity"}:
+        journey_type = "multi_city"
 
-        origin_place = resolve_place(
-            origin
-        )
-
-    except requests.RequestException as error:
-
+    if journey_type not in {"one_way", "return", "multi_city"}:
         return {
             "success": False,
-            "error": (
-                "Duffel origin place search failed: "
-                f"{str(error)}"
-            )
+            "error": "journey_type must be one_way, return, or multi_city."
         }
 
-    # Resolve destination
-    try:
+    # Duffel expects one passenger object per traveller. Preserve the separate
+    # adult/child counts in the request rather than searching for one adult only.
+    passengers = ([{"type": "adult"} for _ in range(adults)] +
+                  [{"type": "child"} for _ in range(children)])
 
-        destination_place = resolve_place(
-            destination
-        )
+    # Build and validate the journey slices. Each slice is resolved to an IATA
+    # code using the existing Duffel place lookup.
+    slices = []
+    resolved_segment_places = []
 
-    except requests.RequestException as error:
+    if journey_type == "multi_city":
+        if not isinstance(multi_city_segments, list) or len(multi_city_segments) < 2:
+            return {
+                "success": False,
+                "error": (
+                    "For a multi-city search, provide at least two "
+                    "multi_city_segments. Each segment needs origin, destination, "
+                    "and departure_date."
+                )
+            }
 
-        return {
-            "success": False,
-            "error": (
-                "Duffel destination place "
-                "search failed: "
-                f"{str(error)}"
-            )
-        }
+        raw_segments = multi_city_segments
+    else:
+        try:
+            start = date.fromisoformat(start_date)
+            end = date.fromisoformat(end_date) if end_date else None
+        except (TypeError, ValueError):
+            return {
+                "success": False,
+                "error": "Invalid date format. Use YYYY-MM-DD."
+            }
 
-    if not origin_place:
+        if end and end < start:
+            return {
+                "success": False,
+                "error": "Return date cannot be before the departure date."
+            }
 
-        return {
-            "success": False,
-            "error": (
-                f"Origin '{origin}' "
-                "could not be found."
-            )
-        }
+        if journey_type == "return" and not end_date:
+            return {
+                "success": False,
+                "error": "A return date is required for a return journey."
+            }
 
-    if not destination_place:
-
-        return {
-            "success": False,
-            "error": (
-                f"Destination '{destination}' "
-                "could not be found."
-            )
-        }
-
-    origin_code = origin_place.get(
-        "iata_code"
-    )
-
-    destination_code = (
-        destination_place.get(
-            "iata_code"
-        )
-    )
-
-    if not origin_code:
-
-        return {
-            "success": False,
-            "error": (
-                f"No IATA code found for "
-                f"origin '{origin}'."
-            )
-        }
-
-    if not destination_code:
-
-        return {
-            "success": False,
-            "error": (
-                f"No IATA code found for "
-                f"destination '{destination}'."
-            )
-        }
-
-    # Create outbound slice
-    slices = [
-        {
-            "origin": origin_code,
-            "destination": destination_code,
+        raw_segments = [{
+            "origin": origin,
+            "destination": destination,
             "departure_date": start_date
-        }
-    ]
+        }]
 
-    # Create return slice
-    if end_date:
+        if journey_type == "return":
+            raw_segments.append({
+                "origin": destination,
+                "destination": origin,
+                "departure_date": end_date
+            })
+
+    for index, segment in enumerate(raw_segments, start=1):
+        if not isinstance(segment, dict):
+            return {
+                "success": False,
+                "error": f"Multi-city segment {index} must be an object."
+            }
+
+        segment_origin = str(segment.get("origin") or "").strip()
+        segment_destination = str(segment.get("destination") or "").strip()
+        segment_date = segment.get("departure_date") or segment.get("date")
+
+        if not segment_origin or not segment_destination or not segment_date:
+            return {
+                "success": False,
+                "error": (
+                    f"Journey segment {index} requires origin, destination, "
+                    "and departure_date (YYYY-MM-DD)."
+                )
+            }
+
+        try:
+            date.fromisoformat(str(segment_date))
+        except ValueError:
+            return {
+                "success": False,
+                "error": f"Invalid departure date in journey segment {index}. Use YYYY-MM-DD."
+            }
+
+        try:
+            origin_place = resolve_place(segment_origin)
+            destination_place = resolve_place(segment_destination)
+        except requests.RequestException as error:
+            return {
+                "success": False,
+                "error": (
+                    f"Duffel place lookup failed for journey segment {index}: "
+                    f"{str(error)}"
+                )
+            }
+
+        if not origin_place:
+            return {
+                "success": False,
+                "error": f"Origin '{segment_origin}' in journey segment {index} could not be found."
+            }
+
+        if not destination_place:
+            return {
+                "success": False,
+                "error": f"Destination '{segment_destination}' in journey segment {index} could not be found."
+            }
+
+        origin_code = origin_place.get("iata_code")
+        destination_code = destination_place.get("iata_code")
+
+        if not origin_code or not destination_code:
+            return {
+                "success": False,
+                "error": (
+                    f"Duffel did not provide an IATA code for journey segment {index}."
+                )
+            }
 
         slices.append({
-            "origin": destination_code,
-            "destination": origin_code,
-            "departure_date": end_date
+            "origin": origin_code,
+            "destination": destination_code,
+            "departure_date": str(segment_date)
         })
+        resolved_segment_places.append((origin_place, destination_place))
+
+    # Keep the top-level route summary aligned with the first and final slices.
+    origin_place = resolved_segment_places[0][0]
+    destination_place = resolved_segment_places[-1][1]
+    origin_code = slices[0]["origin"]
+    destination_code = slices[-1]["destination"]
 
     request_body = {
         "data": {
             "slices": slices,
-            "passengers": [
-                {
-                    "type": "adult"
-                }
-            ],
+            "passengers": passengers,
             "cabin_class": cabin_class,
             "max_connections": 1
         }
@@ -633,6 +681,13 @@ def flight_tool(
         },
         "start_date": start_date,
         "end_date": end_date,
+        "journey_type": journey_type,
+        "passenger_counts": {
+            "adults": adults,
+            "children": children,
+            "total": adults + children
+        },
+        "journey_segments": slices,
         "cabin_class": cabin_class,
         "offer_request_id": data.get(
             "id"
@@ -693,12 +748,13 @@ def create_duffel_order(offer_id: str, passengers: list[dict], amount: str, curr
             return {"success": False, "error": "Live offers are blocked; this booking flow only supports Duffel Test Mode."}
 
         offer_passengers = offer.get("passengers") or []
-        if len(offer_passengers) < len(passengers):
+        if len(offer_passengers) != len(passengers):
             return {
                 "success": False,
                 "error": (
-                    f"The selected offer supports {len(offer_passengers)} passenger(s), "
+                    f"The selected offer contains {len(offer_passengers)} passenger(s), "
                     f"but {len(passengers)} passenger detail record(s) were supplied. "
+                    "The passenger details must match the selected offer exactly. "
                     "Search for a fresh offer with the correct passenger count."
                 ),
             }
